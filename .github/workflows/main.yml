@@ -1,0 +1,122 @@
+name: Frontend CI & Deploy
+
+on:
+  push:
+    branches: [ main, develop, feature/** ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # ---------- REQUIRED ENV FOR DEPLOY ----------
+  # Set these in GitHub → Settings → Secrets and variables → Actions → "Repository secrets"
+  # S3_BUCKET: your S3 bucket name (e.g., my-frontend-site-bucket)
+  # AWS_REGION: e.g., us-east-1
+  # CLOUDFRONT_DISTRIBUTION_ID: your distribution ID (optional: only if using CloudFront)
+  #
+  # Optional: CRA runtime vars (must start with REACT_APP_)
+  # REACT_APP_API_URL: https://api.example.com
+  # ------------------------------------------------
+
+  # Node version to use (CRA 5 works well on Node 18)
+  NODE_VERSION: '18.x'
+
+jobs:
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # (Optional) add any REACT_APP_* env vars you saved as repo "variables" (not secrets)
+      # - name: Print environment (debug)
+      #   run: npx envinfo
+
+      - name: Build
+        # CRA needs REACT_APP_* envs at build time if you use them
+        env:
+          REACT_APP_API_URL: ${{ vars.REACT_APP_API_URL }}
+          REACT_APP_NODE_ENV: production
+          GENERATE_SOURCEMAP: 'false'
+        run: npm run build
+
+      - name: Run tests
+        run: npm test -- --watchAll=false
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: client/build
+
+  deploy:
+    name: Deploy to S3 (+ CloudFront)
+    needs: ci
+    runs-on: ubuntu-latest
+    # Only deploy on pushes to main (not on PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: client/build
+
+      # ---------- Option A: Access Keys (simple) ----------
+      # Add these repo secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ---------- Option B (recommended): OIDC role (comment Option A above and uncomment below) ----------
+      #   1) Create an IAM Role with a trust policy for GitHub OIDC and permissions for S3 + CloudFront
+      #   2) Save its ARN as a repo secret AWS_ROLE_TO_ASSUME
+      # - name: Configure AWS via OIDC
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+      #     aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          if [ -z "$S3_BUCKET" ]; then
+            echo "❌ Missing S3_BUCKET secret"; exit 1
+          fi
+          aws s3 sync client/build "s3://$S3_BUCKET" \
+            --delete \
+            --cache-control "public,max-age=31536000" \
+            --exclude "index.html"
+          # Ensure HTML (SPA) is not cached aggressively
+          aws s3 cp client/build/index.html "s3://$S3_BUCKET/index.html" \
+            --cache-control "no-store, no-cache, must-revalidate, max-age=0" \
+            --content-type "text/html"
+
+      - name: Create CloudFront invalidation (optional)
+        if: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
